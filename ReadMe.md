@@ -720,3 +720,298 @@ ShallowConvNet在被试内MRCP分类上性能很差有些意想不到
 - 被设计为震荡信号分类
 - 平方激活函数和对数激活函数分别为f(X)=x2和f(X)=log(X)
 - 为了数值稳定性，对LOG函数进行了剪裁，使得最小输入值是一个非常小的数字
+
+## 7. EEGNet网络结构解析
+
+***将网络结构与代码实现相对应***
+
+|Block|Layer|#filter|size|#params|Output|Activation|Options|
+|--|--|--|--|--|--|--|--|
+|1|Input||||(C,T)|||
+||reshape||||(1,C,T)|||
+||Conv2D|F1|(1,64)|64*F1|(F1,C,T)|Linear|mode=same|
+||BatchNorm||2*F1|(f1,C,T)||||
+||DepthwiseConv2d|D* F1|(C,1)|C* D* F1|(D*F1,1,T)|Linear|model=valid,depth=D,max norm=1|
+||BatchNorm|||2* D* F1|(D*F1,1,T)|||
+||Activation||||(D* F1,1,T)|ELU||
+||AveragePool2D||(1,4)||(D*F1,1,T//4)|||
+||Dropout*||||(D*F1,1,T//4)||p=0.25 or p=0.5|
+|2|SeparableConv2D|F2|(1,16)|16* D* F1+F2*(D*F1)|(F1,1,T//4)|Linear|model=same|
+||BatchNorm|||2*F2|(F2,1,T//4)|||
+||Activation||||(F2,1,T//4)|ELU||
+||AveragePool2D||(1,8)||(F2,1,T//32)|||
+||Dropout*||||(F2,1,T//32)||p=0.25 or p=0.5|
+||Flatten||||(F2,1,T//32)|||
+|Classifier|Dense|N*(F2*T//32)|||N|Softmax|max norm=0.25|
+
+```python
+data_sample = 384
+sample_size = data_sample
+
+parameters = dict(channel_size=40,
+                      sample_size=sample_size,
+                      kernel_size=65,
+                      sample_rate=128,
+                      dropout_rate=0.2,
+                      min_low_hz=1,
+                      min_band_hz=1,
+                      F1=98,
+                      D=1)
+
+model = EEGNet(4, **parameters)
+
+def EEGNet(nclass,
+           channel_size,
+           sample_size,
+           kernel_size,
+           dropout_rate=0.5,
+           F1=96,
+           D=1,
+           F2=96,
+           *args,
+           **kwargs):
+
+    """
+    第一部分：时间卷积
+    主要是用F1个(1,64)的卷积核，对时间层面进行了卷积，其填充方式为same，所以时间维度的长度没有变
+    张量变换:
+      输入张量(1,C,T)
+      卷积核形状(1,64)
+      卷积核数量F1
+      卷积核参数F1*64
+      输出张量(F1,C,T)
+      BatchNorm
+    对时间上的信息进行了融合，提取出了F1种时间维度上的信息
+    """
+    input1 = Input(shape=(channel_size, sample_size, 1))
+    # 作为网络输入的层，需要的参数是(通道数,样本数,1)
+    ##################################################################
+    block1 = Conv2D(F1, (1, kernel_size), padding='same',
+                    use_bias=False)(input1)
+    # 二维卷积层，该层创建一个卷积核，该卷积核与输入层进行卷积以产生输出张量
+    '''
+    F1：输入空间的维数(卷积中输出滤波器的数量)，在这里是98
+    (1,kernel_size)：指定2D卷积窗口的高度和宽度(这里宽度设置为65,EEGNet指定的是64，这里确改成了65，可能是实验过后65效果更好一些把，后续修改验证一下)。可以使用单个整数为所有空间维度指定相同的值。
+    padding：有两个选择:valid,same，为填充方式，这里选择的是same
+    use_bias：该层是否使用偏差向量，这里选择否
+    activation：指定要使用的激活函数，在EEGNet里指定的是Linear，但是给的代码里确没有使用任何激活函数
+    '''
+    block1 = BatchNormalization()(block1)
+    # 归一化层，和每一批中前一层的激活进行归一化，应用一个保持平均激活和接近0的激活标准偏差接近1的变换
+    """
+    第二部分：空间卷积
+    深度卷积：它的换机核的形状是(C,1)负责对各个空间(不同位置电极的输入)的信息进行整合，填充方式选择valid
+    张量变换：
+      输入张量(F1,C,T)
+      卷积核形状(C,1)
+      卷积核数量D*F1
+      卷积核的参数C*D*F1
+      输出张量(D*F1,1,T)
+      BatchNorm
+    """
+    block1 = DepthwiseConv2D((channel_size, 1),
+                             use_bias=False,
+                             depth_multiplier=1,
+                             depthwise_constraint=max_norm(1.))(block1)
+    # 深度可分离的二维卷积，继承自Conv2D
+    '''
+    深度可分离卷积仅执行深度空间卷积的第一步(分别作用于每个输入通道)
+    (channel_size, 1)：指定2D卷积窗口的高度和宽度。
+    depth_multiplier：深度核矩阵的初始化式。控制在depthwise步骤中每个输入通道生成多少个输出通道。
+    depthwise_constraint：应用于深度核矩阵的约束函数。
+      max_norm权重限制，约束每个隐藏单元的权重，使其具有小于或等于期望值的范数
+    '''
+    block1 = BatchNormalization()(block1)
+    block1 = Activation('elu')(block1)
+    # 对输出应用激活函数。
+    block1 = AveragePooling2D((1, 4))(block1)
+    # 空间数据的平均池化操作
+    '''
+    (1,4)：这里它为pool_size,按照1,4向垂直,水平缩放
+          而且当不指定它的strides时，strides默认为pool_size
+    data_format：默认为channels_last，输入中维度的排序
+        channels_last:对应的形状是(bacth,height,width,channels)
+    '''
+    block1 = Dropout(dropout_rate)(block1)
+    # rate:输入单元下降的部分(0.5)
+    '''
+    经过激活函数和平均池化后张量的变换：
+      输入张量(D*F1,1,T)
+      池化形状(1,4)
+      池化步长(1,4)
+      Dropout p=0.25,p=0.5
+      输出张量(D*F1,1,T//4)
+    '''
+    """
+    第三部分：深度可分离卷积
+    """
+    block2 = SeparableConv2D(F2, (1, 16), use_bias=False,
+                             padding='same')(block1)
+    # 深度可分离的二维卷积
+    '''
+    F2：输出空间的维数(即卷积中输出滤波器的数量)。
+    (1,16)：指定2D卷积窗口的高度和宽度。
+    '''
+    block2 = BatchNormalization()(block2)
+    block2 = Activation('elu')(block2)
+    block2 = AveragePooling2D((1, 8))(block2)
+    block2 = Dropout(dropout_rate)(block2)
+
+    flatten = Flatten(name='flatten')(block2)
+    # 趋于平缓的输入。不影响批处理大小。
+    dense = Dense(nclass, name='dense')(flatten)
+    # 普通的密集连接NN层。
+    # nclass：输出空间的维数。在这里就是分类数
+    softmax = Activation('softmax', name='softmax')(dense)
+
+    return Model(inputs=input1, outputs=softmax)
+```
+
+### 7.1. 相关的知识
+
+#### 正则化
+
+由于训练集样本太少或样本中存在噪声导致过拟合，通过正则化技术来防止模型学习到噪声，增加模型鲁棒性
+
+##### 1. L2-Norm
+
+L2正则化(权值衰减)是通过增加一个额外的项(规范化项)到代价函数上
+
+$C=C_0+\frac{2n}{\lambda} \sum_{w}^{} w^2 $
+
+第一项是损失函数，第二项是L2规范化项
+
+它就是让网络倾向于学习小一点的权重，第一项与第二项的比重由$\lambda$来控制
+
+对w进行求偏导得到权重的更新规则：$w=(1-\tfrac{\eta \lambda  }{n}) w- \eta \tfrac{\partial C_0}{\partial w}$
+
+由因子$(1-\tfrac{\eta \lambda  }{n})$来调整权重w，如果n(n是训练数据量)很大，那么调节因子接近1，权值衰减不明显
+
+##### 2. L1-Norm
+
+类似L2
+
+$C=C_0+\frac{\lambda }{n} \sum_{w}^{} |w|$
+
+权重更新规则：$w=w-\frac{\eta \lambda }{n} sgn(w)-\eta \frac{\partial C_0}{\partial w}$
+
+sgn(w)就是w的正负号，w为正为+1，w为负为-1，w为0则为0
+
+L1的权重压缩比L2的权重压缩相比
+
+- 权重大，L1权重压缩较小
+- 权重小，L1权重压缩较大
+
+**导致的结果：** 倾向于聚集在网路的几个权重高的位置
+
+##### 3. Dropout
+
+通过在训练的过程中随机丢掉部分神经元(仅在本次丢掉)来减少神经网络的规模从而防止过拟合。
+
+- 它强迫一个神经元和随机挑选出来的其他神经元共同工作，这样就减弱了神经元节点间的联合适应性，增强了泛化能力
+- 以概率P(一般取0.5)随机丢掉一些神经元以及它们之间的链接，就可以在训练阶段训练很多(P=0.5时,可以有$2^n$个,n是神经元个数)不同的小规模神经网络模型
+
+![Dropout](MD/assert/7-1-regularization_dropout.png)
+
+##### 4. Max-Norm
+
+Max-Norm+Dropout效果更佳
+
+它的目的是在于限制输入链接权重的大小，使得$||w||_2 \ll r$
+
+- r:超参数
+- $||.||_2$:L2范数
+
+#### 激活函数
+
+&nbsp;&nbsp;&nbsp;&nbsp;添加到人工神经网络中的函数，旨在帮助网络学习数据中的复杂模式。激活函数决定了要发射给下一个神经元的内容。它定义了该节点在给定的输入和输入集合下的输出
+
+![Activation](MD/assert/7-1-activation.png)
+图7.1.2 人工神经元工作原理
+
+##### 1. ELU
+
+ELU 具有 ReLU 的所有优点，并且：
+
+- 没有Dead ReLU的问题，输出的平均值接近0，以0为中心
+- ELU通过减少偏置偏移的影响，使正常梯度更接近单位自然梯度，从而使均值向零加速学习
+- ELU在较小的输入下回饱和至负值，从而减少前向传播的变异和信息
+
+#### 深度卷积和普通卷积
+
+##### 1. 普通卷积
+
+![Ordinary_convolution](MD/assert/7-1-Ordinary_convolution.png)
+
+普通卷积的每个通道都要经过一个不一样的卷积核卷积，然后对得到的所有数据进行相加，得到一个新的通道。
+
+对于每个输出的通道都需要一组与原通道数量相同的卷积核来进行卷积
+
+##### 2. 深度卷积
+
+![depthwise_convolution](MD/assert/7-1-depthwise_convolution.png)
+
+深度卷积的每个通道在经过卷积核之后没有相加的操作，一个(或多个)输出的通道对应一个输入的通道(EEGNet里D就是D个输出通道对应一个输入通道，也就是对一个通道进行D次信息提取)
+
+##### 3. 深度卷积和普通卷积的区别
+
+|普通卷积|深度卷积|
+|--|--|
+|输入张量(F1,C,T)|输入张量(F1,C,T)|
+|卷积核形状(C,1)|卷积核形状(C,1)|
+|输出张量(D*F1,1,T)|输出张量(D*F1,1,T)|
+|总共有D*F1组卷积核|总共有F1组卷积核|
+|一组卷积核的数量为F1|一组卷积核的数量为D|
+|总共需要F1*D*F1个卷积核|总共需要D*F1个卷积核|
+
+***可以看到的是：深度卷积使用了更少的卷积核做了与普通卷积一样的操作***
+
+#### 深度可分离卷积和普通卷积
+
+**目标：** 从三个通道转换到四个通道,深度可分离卷积与普通卷积的区别
+
+##### 1. 普通卷积
+
+![ordinary_convolution](MD/assert/7-1-Ordinary_convolution_2.png)
+
+要将三通道转换为四通道，普通卷积一个输出通道对应一组卷积核，他就需要4组卷积核，一组需要对应三个输入通道，就是一组要有三个卷积核，每个卷积核是3*3的
+
+##### 2. 深度可分离卷积
+
+深度可分离卷积分成两步操作
+
+1. 深度卷积
+2. 1*1卷积核的普通卷积
+
+![step1](MD/assert/7-1-depthwise_convolution_step1.png)
+
+第一步得到三通道卷积，且每个通道仅包含对应通道的信息，不包含其他通道信息，这就需要下一步来整合一下信息并转换为四通道
+
+![step2](MD/assert/7-1-depthwise_convolution_step2.png)
+
+整合通道数量和各个通道的信息
+
+##### 3.对比
+
+***将输入的张量从(D*F1,1,T//4)转换到(F2,1,T//4),他们的不同之处***
+
+普通卷积的参数计算
+
+- (1,16)形状卷积核
+- F2组卷积核每组D*F1个
+- 输出张量(F2,1,T//4)
+- 所需参数F2 D F1*16
+
+深度可分离卷积所需的参数计算
+
+- 第一步卷积：
+  - (1,16)形状卷积核
+  - D*F1组，每组1个
+  - 输出张量(D*F1,1,T//4)
+  - 所需参数D F1 16
+- 第二步卷积：
+  - 使用(1,1)形状卷积核进行卷积
+  - F2组卷积核，每组D*F1个
+  - 输出张量(F2,1,T//4)
+  - 所需参数F2 D F1 1 1
+  - 总共所需参数D F1 16+F2 D F1
